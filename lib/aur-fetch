@@ -6,12 +6,8 @@ AUR_LOCATION=${AUR_LOCATION:-https://aur.archlinux.org}
 XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
 PS4='+(${BASH_SOURCE}:${LINENO}): ${FUNCNAME[0]:+${FUNCNAME[1]}(): }'
 
-# default arguments
-pull_args=('--verbose')
-diff_args=('--patch' '--stat')
-
 # default options
-verbose=0 recurse=0 confirm_seen=0 results=0 sync=no log_fmt=diff
+verbose=0 recurse=0 confirm_seen=0 results=0 update_refs=1 sync=no log_fmt=diff
 
 usage() {
     cat <<! | base64 -d
@@ -30,7 +26,8 @@ if [[ ! -v NO_COLOR ]] && [[ ! -v AUR_DEBUG ]]; then
 fi
 
 opt_short='rvL:S'
-opt_long=('recurse' 'verbose' 'write-log:' 'confirm-seen' 'sync:' 'results:' 'format:')
+opt_long=('recurse' 'verbose' 'write-log:' 'confirm-seen' 'sync:'
+          'results:' 'format:' 'existing')
 opt_hidden=('dump-options')
 
 if ! parseopts "$opt_short" "${opt_long[@]}" "${opt_hidden[@]}" -- "$@"; then
@@ -42,7 +39,8 @@ unset log_dir results_file
 while true; do
     case "$1" in
         -L|--write-log)
-            shift; log_dir=$1 ;;
+            shift
+            log_dir=$1 ;;
         -r|--recurse)
             recurse=1 ;;
         -v|--verbose)
@@ -69,8 +67,11 @@ while true; do
             esac ;;
         --confirm-seen)
             confirm_seen=1 ;;
+        --existing)
+            update_refs=0 ;;
         --results)
-            shift; results_file=$1 ;;
+            shift
+            results_file=$1 ;;
         --dump-options)
             printf -- '--%s\n' "${opt_long[@]}"
             printf -- '%s' "${opt_short}" | sed 's/.:\?/-&\n/g'
@@ -86,7 +87,7 @@ if [[ -v log_dir ]] && [[ ! -d $log_dir ]]; then
 fi
 
 if [[ -v results_file ]]; then
-    : >"$results_file" # truncate file
+    : >"$results_file" || exit 1 # truncate file
     results=1
 fi
 
@@ -95,7 +96,17 @@ if ! (( $# )); then
     exit 1
 fi
 
-# Default to showing PKGBUILD first in patch. (#399)
+if (( confirm_seen )); then
+    msg >&2 "Marking repositories as seen"
+    ret=0
+
+    for pkg in "$@"; do
+        GIT_DIR=$pkg/.git git update-ref 'AUR_SEEN' 'HEAD' || ret=1
+    done
+    exit $ret
+fi
+
+# Default to showing PKGBUILD first in patch (#399)
 mkdir -p "$XDG_CONFIG_HOME/aurutils/$argv0"
 orderfile=$XDG_CONFIG_HOME/aurutils/$argv0/orderfile
 
@@ -103,68 +114,87 @@ if [[ ! -s $orderfile ]]; then
     printf 'PKGBUILD\n' > "$orderfile"
 fi
 
-if (( confirm_seen )); then
-    msg >&2 "Marking repositories as seen"
-fi
+# git helper functions
+aur_diff() {
+    git --no-pager "$1" --patch --stat "$2"
+}
+aur_fetch() {
+    git fetch --verbose
+}
+aur_rebase() {
+    git reset --hard 'HEAD'
+    git rebase --verbose
+}
+aur_reset() {
+    git reset --hard 'HEAD@{upstream}'
+}
+aur_rev() {
+    git rev-parse --quiet --verify "$1"
+}
+aur_result() {
+    printf '%s:file://%s\n' "$1" "$2"
+}
 
 if (( recurse )); then
     aur depends --pkgbase "$@"
 else
-   printf '%s\n' "$@"
+    printf '%s\n' "$@"
 fi | while read -r pkg; do
-    # Avoid issues with filesystem boundaries. (#274)
+    # Avoid issues with filesystem boundaries (#274)
     export GIT_DIR=$pkg/.git GIT_WORK_TREE=$pkg
 
     # Reset/rebase if we are on valid repo
     if [[ -d $pkg ]] && git rev-parse --git-dir >/dev/null; then
-        if (( confirm_seen )); then
-            git update-ref AUR_SEEN HEAD
-            continue # skip diff logic
+        if ! seen=$(aur_rev 'AUR_SEEN'); then
+            warning '%s: %s: AUR_SEEN object not found, assuming HEAD' "$argv0" "$pkg"
+            # XXX fallback to empty tree object?
+            seen=$(aur_rev 'HEAD')
         fi
 
-        git fetch --verbose >&2 || exit 1
+        if (( update_refs )); then
+            aur_fetch || exit 1
 
-        case $sync in
-            auto)
-                if [[ $(git config --get --bool aurutils.rebase) == "true" ]]; then
-                    plain >&2 'aurutils.rebase is set for %s' "$pkg"
-                    sync=rebase
-                else
-                    sync=reset
-                fi ;;
-        esac
+            case $sync in
+                auto)
+                    if [[ $(git config --get --type=bool aurutils.rebase) == 'true' ]]; then
+                        plain >&2 'aurutils.rebase is set for %s' "$pkg"
 
-        case $sync in
-            rebase)
-                git reset --hard 'HEAD' >&2
-                git rebase "${pull_args[@]}" >&2 ;;
-            reset)
-                git reset --hard 'HEAD@{upstream}' >&2 ;;
-        esac || {
-            error '%s: %s: Failed to integrate changes' "$argv0" "$pkg"
-            exit 1
-        }
+                        # XXX only works if all upstream commits are fast-forwarded?
+                        if ! git merge-base --is-ancestor 'HEAD@{upstream}' 'HEAD'; then
+                            aur_rebase
+                        else
+                            : no new upstream commits
+                        fi
+                    else
+                        if [[ $(aur_rev 'HEAD') != $(aur_rev 'HEAD@{upstream}') ]]; then
+                            aur_reset
+                        else
+                            : no new upstream commits
+                        fi
+                    fi ;;
+                reset|rebase)
+                    aur_"$sync" ;;
+            esac || {
+                error '%s: %s: Failed to integrate changes' "$argv0" "$pkg"
+                exit 1
+            }
 
-        if ! seen=$(git rev-parse --quiet --verify AUR_SEEN); then
-            warning '%s: AUR_SEEN object not found for %s, assuming empty tree' "$argv0" "$pkg"
-            seen=$(git hash-object -t tree /dev/null)
+            if (( results )); then
+                aur_result 'fetch' "$PWD/$pkg" | tee -a "$results_file"
+            fi
         fi
 
-        if [[ $seen != "$(git rev-parse HEAD)" ]]; then
+        if [[ $seen != $(aur_rev 'HEAD') ]]; then
+            # Contents have changed since last inspection; print differences
             range=${seen:+$seen..}HEAD
 
-            # Contents have changed since last inspection; print differences.
             if (( verbose )); then
-                git --no-pager "$log_fmt" "${diff_args[@]}" "$range"
+                aur_diff "$log_fmt" "$range"
             fi
 
             if [[ $log_dir ]]; then
-                git --no-pager "$log_fmt" "${diff_args[@]}" "$range" >"$log_dir/$pkg.$log_fmt"
+                aur_diff "$log_fmt" "$range" >"$log_dir/$pkg.$log_fmt"
             fi
-        fi
-
-        if (( results )); then
-            printf 'fetch:file://%s\n' "$PWD/$pkg" | tee -a "$results_file"
         fi
 
     elif [[ -d $pkg ]]; then
@@ -173,15 +203,14 @@ fi | while read -r pkg; do
 
     # Otherwise, try to clone anew
     elif git clone "$AUR_LOCATION/$pkg" "$GIT_DIR"; then
-        if (( confirm_seen )); then
-            git update-ref AUR_SEEN HEAD
-        fi
+        # XXX initialize AUR_SEEN to empty tree object?
+        #git update-ref 'AUR_SEEN' 4b825dc642cb6eb9a060e54bf8d69288fbee4904
 
         # Show PKGBUILDs first. (#399)
         git config diff.orderFile "$orderfile"
 
         if (( results )); then
-            printf 'clone:file://%s\n' "$PWD/$pkg" | tee -a "$results_file"
+            aur_result 'clone' "$PWD/$pkg" | tee -a "$results_file"
         fi
     else
         error '%s: %s: Failed to clone repository' "$argv0" "$pkg"
