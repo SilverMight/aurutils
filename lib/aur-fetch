@@ -118,9 +118,6 @@ fi
 aur_diff() {
     git --no-pager "$1" --patch --stat "$2"
 }
-aur_fetch() {
-    git fetch --verbose
-}
 aur_rebase() {
     git reset --hard 'HEAD'
     git rebase --verbose
@@ -145,14 +142,17 @@ fi | while read -r pkg; do
 
     # Reset/rebase if we are on valid repo
     if [[ -d $pkg ]] && git rev-parse --git-dir >/dev/null; then
-        if ! seen=$(aur_rev 'AUR_SEEN'); then
-            warning '%s: %s: AUR_SEEN object not found, assuming HEAD' "$argv0" "$pkg"
-            # XXX fallback to empty tree object?
-            seen=$(aur_rev 'HEAD')
+        # Define default value for AUR_SEEN (#659)
+        if [[ -v AUR_SEEN_STRICT ]]; then
+            seen_fallback=$(git hash-object -t tree /dev/null)
+        else
+            seen_fallback=$(aur_rev 'HEAD')
         fi
+        seen=$(aur_rev 'AUR_SEEN')
+        seen=${seen:-$seen_fallback}
 
         if (( update_refs )); then
-            aur_fetch || exit 1
+            git fetch --verbose || exit 1
 
             case $sync in
                 auto)
@@ -162,14 +162,10 @@ fi | while read -r pkg; do
                         # XXX only works if all upstream commits are fast-forwarded?
                         if ! git merge-base --is-ancestor 'HEAD@{upstream}' 'HEAD'; then
                             aur_rebase
-                        else
-                            : no new upstream commits
                         fi
                     else
                         if [[ $(aur_rev 'HEAD') != $(aur_rev 'HEAD@{upstream}') ]]; then
                             aur_reset
-                        else
-                            : no new upstream commits
                         fi
                     fi ;;
                 reset|rebase)
